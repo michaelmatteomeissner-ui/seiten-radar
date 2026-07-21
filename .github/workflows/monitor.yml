@@ -1,0 +1,50 @@
+name: Seiten-Radar
+
+on:
+  schedule:
+    # Alle 15 Minuten. Zeitplan ist "best effort" – bei GitHub-Last
+    # kann es auch mal 20-30 Min. dauern. Kürzer als 5 Min. geht nicht.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # erlaubt manuellen Start per Knopfdruck
+
+# Nötig, damit der Workflow den gespeicherten Stand zurückschreiben darf
+permissions:
+  contents: write
+
+concurrency:
+  group: radar
+  cancel-in-progress: false
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Playwright installieren
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Seiten prüfen
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORT: ${{ secrets.SMTP_PASSWORT }}
+          EMPFAENGER: ${{ secrets.EMPFAENGER }}
+        run: python monitor.py
+
+      - name: Stand speichern
+        run: |
+          git config user.name "seiten-radar"
+          git config user.email "radar@users.noreply.github.com"
+          git add stand.json
+          git diff --staged --quiet || git commit -m "Stand aktualisiert"
+          git push
