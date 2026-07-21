@@ -3,7 +3,7 @@ name: Seiten-Radar
 on:
   schedule:
     # Alle 15 Minuten. Zeitplan ist "best effort" – bei GitHub-Last
-    # kann es auch mal 20-30 Min. dauern. Kürzer als 5 Min. geht nicht.
+    # kann ein Lauf auch mal 10-20 Min. später starten.
     - cron: "*/15 * * * *"
   workflow_dispatch:        # erlaubt manuellen Start per Knopfdruck
 
@@ -34,11 +34,7 @@ jobs:
 
       - name: Seiten prüfen
         env:
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORT: ${{ secrets.SMTP_PASSWORT }}
-          EMPFAENGER: ${{ secrets.EMPFAENGER }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python monitor.py
 
       - name: Stand speichern
