@@ -2,7 +2,9 @@
   "seiten": [
     {
       "url": "https://www.pokemoncenter.com/de-de",
-      "max_seiten": 25
+      "max_seiten": 0,
+      "produkt_muster": "/product/",
+      "nur_pfad": "/de-de/"
     }
   ]
 }
