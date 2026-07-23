@@ -2,8 +2,10 @@
 Webseiten-Monitor für GitHub Actions – mit ntfy-Push aufs Handy.
 Läuft in der Cloud, deine Geräte können ausgeschaltet sein.
 
-Seiten werden in seiten.json konfiguriert.
-Das ntfy-Topic kommt aus dem GitHub Secret NTFY_TOPIC.
+Meldet neue Produkte in Portionen zu je 8 Stück – alle, nichts wird
+abgeschnitten. Jedes Produkt mit lesbarem Namen und Direktlink.
+
+Konfiguration in seiten.json, ntfy-Topic im Secret NTFY_TOPIC.
 """
 
 import json
@@ -13,7 +15,7 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 from playwright.sync_api import sync_playwright
@@ -27,6 +29,10 @@ NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+PRO_NACHRICHT = 8        # Produkte pro Push-Nachricht
+MAX_NACHRICHTEN = 30     # Sicherheitsgrenze gegen ntfy-Ratelimit
+PAUSE = 2                # Sekunden zwischen den Nachrichten
 
 
 def lade(pfad, standard):
@@ -46,34 +52,106 @@ def nur_ascii(text: str) -> str:
     return unicodedata.normalize("NFKD", ersetzt).encode("ascii", "ignore").decode()
 
 
-def sende_push(titel: str, text: str, klick_url: str = "") -> None:
-    """Schickt eine Push-Nachricht über ntfy an dein Handy."""
+def name_aus_url(url: str) -> str:
+    """Leitet aus der URL einen lesbaren Produktnamen ab.
+    .../product/70-11095-101/pokemon-trainer-umhaengetasche
+        → 'Pokemon Trainer Umhaengetasche'
+    """
+    segmente = [s for s in urlparse(url).path.split("/") if s]
+    teil = ""
+    for seg in reversed(segmente):
+        kandidat = unquote(seg)
+        # ID-Segmente wie "70-11095-101" überspringen
+        if re.fullmatch(r"[\d\-_]+", kandidat):
+            continue
+        if re.search(r"[a-zA-Z]", kandidat):
+            teil = kandidat
+            break
+    if not teil:
+        return url
+    return re.sub(r"[-_]+", " ", teil).strip().title()
+
+
+def sende_push(titel: str, text: str, klick_url: str = "",
+               tags: str = "bell") -> bool:
+    """Schickt eine Push-Nachricht über ntfy."""
     if not NTFY_TOPIC:
         print("  ⚠ Kein NTFY_TOPIC gesetzt – Push übersprungen.")
-        return
-    kopf = {
-        "Title": nur_ascii(titel),
-        "Priority": "high",
-        "Tags": "bell,shopping",
-    }
+        return False
+    kopf = {"Title": nur_ascii(titel), "Priority": "high", "Tags": tags}
     if klick_url:
-        # Tippen auf die Meldung öffnet direkt das Produkt
         kopf["Click"] = klick_url
     req = Request(f"{NTFY_SERVER}/{NTFY_TOPIC}",
                   data=text.encode("utf-8"), headers=kopf)
     try:
         with urlopen(req, timeout=20) as r:
             r.read()
-        print("  🔔 Push verschickt.")
+        return True
     except Exception as e:
         print(f"  ⚠ Push fehlgeschlagen: {e}")
+        return False
+
+
+def melde_produkte(neue: list[str], shop: str, start_url: str) -> None:
+    """Verschickt alle neuen Produkte portionsweise, je PRO_NACHRICHT Stück."""
+    pakete = [neue[i:i + PRO_NACHRICHT]
+              for i in range(0, len(neue), PRO_NACHRICHT)]
+    gesamt = len(pakete)
+
+    if gesamt > MAX_NACHRICHTEN:
+        sende_push(
+            titel=f"{len(neue)} neue Produkte – sehr viele!",
+            text=(f"Es sind {len(neue)} neue Produkte aufgetaucht. "
+                  f"Das sind zu viele fuer Einzelmeldungen. "
+                  f"Schau direkt im Shop nach."),
+            klick_url=start_url, tags="warning")
+        print(f"  ⚠ {len(neue)} neue Produkte – zu viele, nur Sammelmeldung.")
+        return
+
+    verschickt = 0
+    for nr, paket in enumerate(pakete, 1):
+        zeilen = []
+        for pos, url in enumerate(paket, 1):
+            zeilen.append(f"{pos}. {name_aus_url(url)}\n{url}")
+        titel = (f"🆕 {len(neue)} neue Produkte ({nr}/{gesamt})"
+                 if gesamt > 1 else f"🆕 {len(neue)} neue Produkte")
+        if sende_push(titel=titel, text="\n\n".join(zeilen),
+                      klick_url=paket[0], tags="new,shopping"):
+            verschickt += 1
+        if nr < gesamt:
+            time.sleep(PAUSE)
+    print(f"  🔔 {verschickt} von {gesamt} Nachrichten verschickt.")
+
+
+def sammle_sitemap_urls(page, sitemap_url: str, netloc: str) -> set[str]:
+    """Liest eine Sitemap (auch Sitemap-Index) rekursiv aus."""
+    urls: set[str] = set()
+    try:
+        page.goto(sitemap_url, timeout=60_000)
+        inhalt = page.content()
+    except Exception:
+        return urls
+    locs = re.findall(r"<loc>\s*(.*?)\s*</loc>", inhalt)
+    unter = [u for u in locs if u.endswith(".xml")]
+    urls.update(u.split("?")[0] for u in locs
+                if netloc in u and not u.endswith(".xml"))
+    # Produkt-Sitemaps zuerst
+    reihenfolge = sorted(unter, key=lambda u: "product" not in u.lower())
+    for sm in reihenfolge[:10]:
+        try:
+            page.goto(sm, timeout=60_000)
+            for u in re.findall(r"<loc>\s*(.*?)\s*</loc>", page.content()):
+                if netloc in u and not u.endswith(".xml"):
+                    urls.add(u.split("?")[0])
+        except Exception:
+            continue
+    return urls
 
 
 def sammle_urls(start_url: str, max_seiten: int) -> set[str]:
-    """Sammelt URLs der Domain: erst Sitemap, dann Crawling ab der Startseite."""
+    """Sammelt alle URLs der Domain über die Sitemap (+ optional Crawl)."""
     parsed = urlparse(start_url)
     basis = f"{parsed.scheme}://{parsed.netloc}"
-    gefunden: set[str] = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -85,53 +163,33 @@ def sammle_urls(start_url: str, max_seiten: int) -> set[str]:
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page = ctx.new_page()
 
-        # 1) Sitemap – dort listet die Seite ihre Unterseiten selbst auf
-        try:
-            page.goto(f"{basis}/sitemap.xml", timeout=45_000)
-            locs = re.findall(r"<loc>\s*(.*?)\s*</loc>", page.content())
-            gefunden.update(u.split("?")[0] for u in locs
-                            if parsed.netloc in u and not u.endswith(".xml"))
-            for unter in [u for u in locs if u.endswith(".xml")][:5]:
-                try:
-                    page.goto(unter, timeout=45_000)
-                    gefunden.update(
-                        u.split("?")[0]
-                        for u in re.findall(r"<loc>\s*(.*?)\s*</loc>", page.content())
-                        if parsed.netloc in u and not u.endswith(".xml"))
-                except Exception:
-                    pass
-            if gefunden:
-                print(f"  Sitemap: {len(gefunden)} Seiten")
-        except Exception as e:
-            print(f"  Keine Sitemap ({type(e).__name__})")
+        alle = sammle_sitemap_urls(page, f"{basis}/sitemap.xml", parsed.netloc)
+        print(f"  Sitemap: {len(alle)} URLs")
 
-        # 2) Crawling ab der Startseite
-        warteschlange, besucht = [start_url], set()
-        while warteschlange and len(besucht) < max_seiten:
-            url = warteschlange.pop(0)
-            if url in besucht:
-                continue
-            besucht.add(url)
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                time.sleep(5)
-                for _ in range(4):
-                    page.mouse.wheel(0, 2500)
-                    time.sleep(1.2)
-                links = page.eval_on_selector_all(
-                    "a[href]",
-                    "els => els.map(a => a.href.split('#')[0].split('?')[0])")
-                for link in links:
-                    if link.startswith(basis):
-                        neu = link not in gefunden
-                        gefunden.add(link)
-                        if neu and link not in besucht and len(besucht) < max_seiten:
-                            warteschlange.append(link)
-            except Exception:
-                continue
-        print(f"  Crawl: {len(besucht)} Seiten besucht")
+        if max_seiten > 0:
+            besucht = set()
+            warteschlange = [start_url]
+            while warteschlange and len(besucht) < max_seiten:
+                url = warteschlange.pop(0)
+                if url in besucht:
+                    continue
+                besucht.add(url)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                    time.sleep(4)
+                    for _ in range(3):
+                        page.mouse.wheel(0, 2500)
+                        time.sleep(1)
+                    links = page.eval_on_selector_all(
+                        "a[href]",
+                        "els => els.map(a => a.href.split('#')[0].split('?')[0])")
+                    alle.update(l for l in links if l.startswith(basis))
+                except Exception:
+                    continue
+            print(f"  Crawl: {len(besucht)} Seiten besucht")
+
         browser.close()
-    return gefunden
+    return alle
 
 
 def main() -> None:
@@ -140,44 +198,47 @@ def main() -> None:
     aenderung = False
 
     if not NTFY_TOPIC:
-        print("⚠ Secret NTFY_TOPIC fehlt – es werden keine Push-Nachrichten verschickt.")
+        print("⚠ Secret NTFY_TOPIC fehlt – keine Push-Nachrichten.")
 
     for eintrag in konfig["seiten"]:
         url = eintrag["url"]
-        max_seiten = eintrag.get("max_seiten", 25)
-        name = urlparse(url).netloc
+        max_seiten = eintrag.get("max_seiten", 0)
+        muster = re.compile(eintrag.get("produkt_muster", r"/product/"), re.I)
+        nur_pfad = eintrag.get("nur_pfad", "")   # z.B. "/de-de/"
+        shop = urlparse(url).netloc
         print(f"\n▶ {url}")
+
         try:
-            aktuelle = sammle_urls(url, max_seiten)
+            alle = sammle_urls(url, max_seiten)
         except Exception as e:
             print(f"  ⚠ Fehler: {e}")
             continue
 
-        if not aktuelle:
-            print("  ⚠ Nichts gefunden (Bot-Schutz?) – Stand bleibt unverändert.")
+        produkte = {u for u in alle if muster.search(u)}
+        if nur_pfad:
+            produkte = {u for u in produkte if nur_pfad in u}
+            print(f"  Produkte (nur {nur_pfad}): {len(produkte)}")
+        else:
+            print(f"  Produkte: {len(produkte)}")
+
+        if not produkte:
+            print("  ⚠ Nichts gefunden – Stand bleibt unverändert.")
             continue
 
         bekannte = set(stand.get(url, []))
         if not bekannte:
-            print(f"  Erster Lauf: {len(aktuelle)} Seiten erfasst.")
+            print(f"  Erster Lauf: {len(produkte)} erfasst (keine Meldung).")
         else:
-            neue = sorted(aktuelle - bekannte)
+            neue = sorted(produkte - bekannte)
             if neue:
-                print(f"  🎉 {len(neue)} neue Seiten!")
+                print(f"  🎉 {len(neue)} NEUE Produkte:")
                 for u in neue[:20]:
-                    print(f"     {u}")
-                text = "\n\n".join(neue[:8])
-                if len(neue) > 8:
-                    text += f"\n\n… und {len(neue) - 8} weitere."
-                sende_push(
-                    titel=f"{len(neue)} neue Seiten: {name}",
-                    text=text,
-                    klick_url=neue[0],
-                )
+                    print(f"     {name_aus_url(u)}  →  {u}")
+                melde_produkte(neue, shop, url)
             else:
-                print("  Keine neuen Seiten.")
+                print("  Keine neuen Produkte.")
 
-        stand[url] = sorted(bekannte | aktuelle)
+        stand[url] = sorted(bekannte | produkte)
         aenderung = True
 
     if aenderung:
